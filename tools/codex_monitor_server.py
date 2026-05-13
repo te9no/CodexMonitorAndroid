@@ -9,11 +9,13 @@ import os
 
 import socket
 import itertools
+import ssl
 
 DAEMON_HOST = os.environ.get('CODEX_MONITOR_DAEMON_HOST', '127.0.0.1')
 DAEMON_PORT = int(os.environ.get('CODEX_MONITOR_DAEMON_PORT', '4732'))
 DAEMON_TOKEN = os.environ.get('CODEX_MONITOR_DAEMON_TOKEN', '')
 ENABLE_DAEMON = os.environ.get('CODEX_MONITOR_ENABLE_DAEMON', '').lower() in ('1', 'true', 'yes')
+ENABLE_DAEMON_SEND = os.environ.get('CODEX_MONITOR_ENABLE_DAEMON_SEND', '').lower() in ('1', 'true', 'yes')
 ALLOW_PROMPT_QUEUE = os.environ.get('CODEX_MONITOR_ALLOW_PROMPT_QUEUE', '').lower() in ('1', 'true', 'yes')
 _rpc_ids = itertools.count(1)
 
@@ -315,7 +317,13 @@ def queue_prompt(codex_home: Path, item):
     item.setdefault('timestamp', datetime.now().isoformat(timespec='seconds'))
     item.setdefault('status', 'queued')
     item.setdefault('daemon', daemon_execution_disabled())
-    with prompt_queue_path(codex_home).open('a', encoding='utf-8') as handle:
+    path = prompt_queue_path(codex_home)
+    if path.exists() and path.stat().st_size > 0:
+        with path.open('rb+') as handle:
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b'\n':
+                handle.write(b'\n')
+    with path.open('a', encoding='utf-8', newline='\n') as handle:
         handle.write(json.dumps(item, ensure_ascii=False) + '\n')
     return item
 
@@ -326,6 +334,58 @@ def daemon_execution_disabled():
         'skipped': True,
         'reason': 'daemon execution is disabled; mobile requests are queued only',
     }
+
+
+def try_send_prompt_via_daemon(session_id: str, file: Path, prompt: str):
+    if not ENABLE_DAEMON_SEND:
+        return daemon_execution_disabled()
+    if not prompt.strip():
+        return {'sent': False, 'error': 'prompt is required'}
+
+    meta = read_first_meta(file)
+    cwd = meta.get('cwd') or ''
+    workspace = workspace_map_from_daemon().get(normalize_path(cwd)) if cwd else None
+    if not workspace:
+        return {'sent': False, 'error': 'daemon workspace not found'}
+    if not workspace.get('connected'):
+        return {'sent': False, 'workspaceId': workspace.get('id'), 'error': 'daemon workspace not connected'}
+
+    workspace_id = workspace.get('id')
+    threads = thread_map_from_daemon({normalize_path(cwd): workspace})
+    thread = threads.get(str(session_id))
+    if not thread:
+        return {
+            'sent': False,
+            'workspaceId': workspace_id,
+            'error': 'daemon thread not found; open the target session in Codex Monitor first',
+        }
+
+    params = {
+        'workspaceId': workspace_id,
+        'threadId': str(thread.get('id') or session_id),
+        'message': prompt,
+        'text': prompt,
+    }
+    try:
+        result = daemon_rpc('send_user_message', params, timeout=10)
+        nested_error = extract_nested_error(result)
+        if nested_error:
+            return {'sent': False, 'workspaceId': workspace_id, 'threadId': params['threadId'], 'error': nested_error, 'result': result}
+        return {'sent': True, 'workspaceId': workspace_id, 'threadId': params['threadId'], 'result': result}
+    except Exception as exc:
+        return {'sent': False, 'workspaceId': workspace_id, 'threadId': params['threadId'], 'error': str(exc)}
+
+
+def extract_nested_error(result):
+    if isinstance(result, dict):
+        if isinstance(result.get('error'), dict):
+            return result['error'].get('message') or json.dumps(result['error'], ensure_ascii=False)
+        inner = result.get('result')
+        while isinstance(inner, dict):
+            if isinstance(inner.get('error'), dict):
+                return inner['error'].get('message') or json.dumps(inner['error'], ensure_ascii=False)
+            inner = inner.get('result')
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -406,7 +466,7 @@ class Handler(BaseHTTPRequestHandler):
             self.write_json(404, {'error': 'not found'})
             return
 
-        if not ALLOW_PROMPT_QUEUE:
+        if not (ALLOW_PROMPT_QUEUE or ENABLE_DAEMON_SEND):
             self.write_json(409, {
                 'ok': False,
                 'error': 'prompt submission is disabled on the PC bridge',
@@ -425,11 +485,32 @@ class Handler(BaseHTTPRequestHandler):
             self.write_json(404, {'error': 'session not found'})
             return
 
+        daemon_result = try_send_prompt_via_daemon(session_id, file, prompt)
+        if daemon_result.get('sent'):
+            self.write_json(200, {
+                'ok': True,
+                'sent': True,
+                'queued': False,
+                'daemon': daemon_result,
+            })
+            return
+
+        if not ALLOW_PROMPT_QUEUE:
+            self.write_json(502, {
+                'ok': False,
+                'sent': False,
+                'queued': False,
+                'daemon': daemon_result,
+                'error': daemon_result.get('error') or 'daemon send failed',
+            })
+            return
+
         item = queue_prompt(self.codex_home, {
             'sessionId': session_id,
             'sessionFile': str(file),
             'prompt': prompt,
             'source': 'android',
+            'daemon': daemon_result,
         })
 
         self.write_json(202, {
@@ -453,7 +534,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global DAEMON_HOST, DAEMON_PORT, DAEMON_TOKEN, ENABLE_DAEMON
+    global DAEMON_HOST, DAEMON_PORT, DAEMON_TOKEN, ENABLE_DAEMON, ENABLE_DAEMON_SEND, ALLOW_PROMPT_QUEUE
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=8787)
@@ -463,27 +544,51 @@ def main():
     parser.add_argument('--daemon-port', type=int, default=DAEMON_PORT)
     parser.add_argument('--daemon-token', default=DAEMON_TOKEN)
     parser.add_argument('--enable-daemon', action='store_true', default=ENABLE_DAEMON)
+    parser.add_argument('--enable-daemon-send', action='store_true', default=ENABLE_DAEMON_SEND)
     parser.add_argument('--auth-token', default=os.environ.get('CODEX_MONITOR_AUTH_TOKEN', ''))
+    parser.add_argument('--allow-no-auth', action='store_true')
+    parser.add_argument('--allow-prompt-queue', action='store_true', default=ALLOW_PROMPT_QUEUE)
+    parser.add_argument('--tls-cert', default=os.environ.get('CODEX_MONITOR_TLS_CERT', ''))
+    parser.add_argument('--tls-key', default=os.environ.get('CODEX_MONITOR_TLS_KEY', ''))
     args = parser.parse_args()
 
-    if args.host not in ('127.0.0.1', 'localhost', '::1') and not args.auth_token:
-        parser.error('--auth-token or CODEX_MONITOR_AUTH_TOKEN is required when binding beyond localhost')
+    if args.host not in ('127.0.0.1', 'localhost', '::1') and not args.auth_token and not args.allow_no_auth:
+        parser.error('--auth-token, CODEX_MONITOR_AUTH_TOKEN, or --allow-no-auth is required when binding beyond localhost')
+    if args.allow_prompt_queue and not args.auth_token:
+        parser.error('--allow-prompt-queue requires --auth-token or CODEX_MONITOR_AUTH_TOKEN')
+    if args.enable_daemon_send and not args.enable_daemon:
+        parser.error('--enable-daemon-send requires --enable-daemon')
+    if args.enable_daemon_send and not args.auth_token:
+        parser.error('--enable-daemon-send requires --auth-token or CODEX_MONITOR_AUTH_TOKEN')
+    if bool(args.tls_cert) != bool(args.tls_key):
+        parser.error('--tls-cert and --tls-key must be provided together')
 
     DAEMON_HOST = args.daemon_host
     DAEMON_PORT = args.daemon_port
     DAEMON_TOKEN = args.daemon_token
     ENABLE_DAEMON = args.enable_daemon
+    ENABLE_DAEMON_SEND = args.enable_daemon_send
+    ALLOW_PROMPT_QUEUE = args.allow_prompt_queue
 
     Handler.codex_home = Path(args.codex_home)
     Handler.limit = args.limit
     Handler.auth_token = args.auth_token
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f'Codex Monitor server listening on http://{args.host}:{args.port}', flush=True)
-    auth_state = 'enabled' if Handler.auth_token else 'disabled for localhost-only listener'
+    scheme = 'https' if args.tls_cert else 'http'
+    if args.tls_cert:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(args.tls_cert, args.tls_key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    print(f'Codex Monitor server listening on {scheme}://{args.host}:{args.port}', flush=True)
+    auth_state = 'enabled' if Handler.auth_token else 'disabled'
     print(f'HTTP bridge auth: {auth_state}', flush=True)
     daemon_state = 'enabled' if ENABLE_DAEMON else 'disabled'
     print(f'Codex Monitor daemon integration: {daemon_state}', flush=True)
-    print(f'Android over Tailscale: http://<pc-tailscale-ip-or-name>:{args.port}', flush=True)
+    daemon_send_state = 'enabled' if ENABLE_DAEMON_SEND else 'disabled'
+    print(f'Codex Monitor daemon prompt send: {daemon_send_state}', flush=True)
+    queue_state = 'enabled' if ALLOW_PROMPT_QUEUE else 'disabled'
+    print(f'Prompt queue submission: {queue_state}', flush=True)
+    print(f'Android over Tailscale: {scheme}://<pc-tailscale-ip-or-name>:{args.port}', flush=True)
     server.serve_forever()
 
 

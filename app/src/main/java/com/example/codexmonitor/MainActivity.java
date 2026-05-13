@@ -458,7 +458,7 @@ public class MainActivity extends Activity {
         form.setOrientation(LinearLayout.VERTICAL);
         form.setPadding(dp(4), dp(10), dp(4), 0);
 
-        TextView helper = text("Use your PC Tailscale address and the bridge token configured on the server.", 14, Color.rgb(77, 88, 78), Typeface.NORMAL);
+        TextView helper = text("Use your PC Tailscale address and bridge token. Leave token empty only for read-only local testing.", 14, Color.rgb(77, 88, 78), Typeface.NORMAL);
         helper.setPadding(0, 0, 0, dp(12));
         form.addView(helper);
 
@@ -482,10 +482,6 @@ public class MainActivity extends Activity {
         dialog.setOnShowListener(d -> dialog.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener(v -> {
             apiBaseUrl = normalizeBaseUrl(url.getText().toString().trim());
             apiToken = token.getText().toString().trim();
-            if (!apiBaseUrl.isEmpty() && apiToken.isEmpty()) {
-                token.setError("Required");
-                return;
-            }
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                     .edit()
                     .putString(KEY_API_BASE_URL, apiBaseUrl)
@@ -528,7 +524,7 @@ public class MainActivity extends Activity {
                 new Handler(Looper.getMainLooper()).post(() -> {
                     render();
                     if (showToast) {
-                        Toast.makeText(this, "Sync failed: " + error.getMessage(), Toast.LENGTH_LONG).show();
+                        Toast.makeText(this, "Sync failed for " + apiBaseUrl + ": " + error.getMessage(), Toast.LENGTH_LONG).show();
                     }
                 });
             }
@@ -673,7 +669,7 @@ public class MainActivity extends Activity {
         form.setOrientation(LinearLayout.VERTICAL);
         form.setPadding(dp(4), dp(10), dp(4), 0);
 
-        TextView helper = text("This queues a prompt on the PC bridge. Direct live injection into Codex is not enabled yet.", 14, Color.rgb(77, 88, 78), Typeface.NORMAL);
+        TextView helper = text("This sends a prompt to the PC bridge. It is queued unless daemon live send is enabled and the target session is connected.", 14, Color.rgb(77, 88, 78), Typeface.NORMAL);
         helper.setPadding(0, 0, 0, dp(12));
         form.addView(helper);
 
