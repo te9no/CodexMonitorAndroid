@@ -2,12 +2,20 @@ package com.example.codexmonitor;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.DialogInterface;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
@@ -26,16 +34,28 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.BufferedReader;
+import java.io.OutputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.HashSet;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 
 public class MainActivity extends Activity {
     private static final String PREFS_NAME = "codex_monitor";
     private static final String KEY_SESSIONS = "sessions";
+    private static final String KEY_API_BASE_URL = "api_base_url";
+    private static final String KEY_API_TOKEN = "api_token";
+    private static final String NOTIFICATION_CHANNEL = "codex_monitor_alerts";
     private static final String FILTER_ALL = "ALL";
     private static final String STATUS_RUNNING = "RUNNING";
     private static final String STATUS_BLOCKED = "BLOCKED";
@@ -62,7 +82,21 @@ public class MainActivity extends Activity {
     private LinearLayout statsRow;
     private TextView summary;
     private TextView countBadge;
+    private TextView connectionStatus;
     private String activeFilter = FILTER_ALL;
+    private String apiBaseUrl = "";
+    private String apiToken = "";
+    private final Handler refreshHandler = new Handler(Looper.getMainLooper());
+    private final Set<String> notifiedApprovals = new HashSet<>();
+    private final Runnable autoRefresh = new Runnable() {
+        @Override
+        public void run() {
+            if (!apiBaseUrl.isEmpty()) {
+                fetchRemoteSessions(false);
+            }
+            refreshHandler.postDelayed(this, 30000);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -70,6 +104,11 @@ public class MainActivity extends Activity {
         getWindow().setStatusBarColor(ink);
         getWindow().setNavigationBarColor(ink);
 
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        apiBaseUrl = prefs.getString(KEY_API_BASE_URL, "");
+        apiToken = prefs.getString(KEY_API_TOKEN, "");
+        createNotificationChannel();
+        requestNotificationPermission();
         loadSessions();
         if (sessions.isEmpty()) {
             seedExamples();
@@ -77,6 +116,13 @@ public class MainActivity extends Activity {
 
         setContentView(buildContent());
         render();
+        refreshHandler.postDelayed(autoRefresh, 30000);
+    }
+
+    @Override
+    protected void onDestroy() {
+        refreshHandler.removeCallbacks(autoRefresh);
+        super.onDestroy();
     }
 
     private View buildContent() {
@@ -163,6 +209,28 @@ public class MainActivity extends Activity {
         summary.setPadding(0, dp(14), 0, 0);
         hero.addView(summary);
 
+        LinearLayout connectionRow = new LinearLayout(this);
+        connectionRow.setOrientation(LinearLayout.HORIZONTAL);
+        connectionRow.setGravity(Gravity.CENTER_VERTICAL);
+        connectionRow.setPadding(0, dp(14), 0, 0);
+
+        connectionStatus = text("", 12, textSecondary, Typeface.BOLD);
+        connectionStatus.setPadding(0, 0, dp(10), 0);
+        connectionRow.addView(connectionStatus, new LinearLayout.LayoutParams(
+                0,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                1f));
+
+        TextView server = smallButton("Server", textSecondary);
+        server.setOnClickListener(v -> showServerDialog());
+        connectionRow.addView(server, compactButtonParams(true));
+
+        TextView sync = smallButton("Sync", accent);
+        sync.setOnClickListener(v -> fetchRemoteSessions(true));
+        connectionRow.addView(sync, compactButtonParams(false));
+
+        hero.addView(connectionRow);
+
         return hero;
     }
 
@@ -173,6 +241,11 @@ public class MainActivity extends Activity {
 
         countBadge.setText(String.format(Locale.US, "%d total", sessions.size()));
         summary.setText("Tap a status pill to triage work. Use filters to focus on what needs attention.");
+        if (apiBaseUrl.isEmpty()) {
+            connectionStatus.setText("Manual mode. Set Tailscale server URL.");
+        } else {
+            connectionStatus.setText("Server " + apiBaseUrl);
+        }
 
         renderStats(runningCount, blockedCount, doneCount);
         renderFilters(runningCount, blockedCount, doneCount);
@@ -246,6 +319,12 @@ public class MainActivity extends Activity {
         top.addView(status);
         card.addView(top);
 
+        if (session.approvalPending) {
+            TextView approval = text("APPROVAL WAITING", 12, blocked, Typeface.BOLD);
+            approval.setPadding(0, dp(10), 0, 0);
+            card.addView(approval);
+        }
+
         TextView detail = text(session.detail, 15, textSecondary, Typeface.NORMAL);
         detail.setLineSpacing(dp(2), 1.0f);
         detail.setPadding(0, dp(14), 0, dp(16));
@@ -254,11 +333,10 @@ public class MainActivity extends Activity {
         LinearLayout actions = new LinearLayout(this);
         actions.setOrientation(LinearLayout.HORIZONTAL);
 
+        actions.addView(action("Open", accent, () -> showSessionDetail(session)), actionParams(true));
+        actions.addView(action("Prompt", done, () -> showPromptDialog(session)), actionParams(true));
         actions.addView(action("Run", running, () -> updateStatus(session, STATUS_RUNNING)), actionParams(true));
-        actions.addView(action("Block", blocked, () -> updateStatus(session, STATUS_BLOCKED)), actionParams(true));
-        actions.addView(action("Done", done, () -> updateStatus(session, STATUS_DONE)), actionParams(true));
-        actions.addView(action("Edit", textSecondary, () -> showSessionDialog(session)), actionParams(true));
-        actions.addView(action("Delete", blocked, () -> confirmDelete(session)), actionParams(false));
+        actions.addView(action("Done", done, () -> updateStatus(session, STATUS_DONE)), actionParams(false));
 
         card.addView(actions);
         return card;
@@ -349,12 +427,19 @@ public class MainActivity extends Activity {
             }
 
             if (existing == null) {
+                if (!apiBaseUrl.isEmpty()) {
+                    createRemoteSession(enteredName, enteredDetail);
+                    dialog.dismiss();
+                    return;
+                }
                 sessions.add(0, new CodexSession(
                         UUID.randomUUID().toString(),
                         enteredName,
                         enteredDetail,
                         status.getSelectedItem().toString(),
-                        now()));
+                        now(),
+                        false,
+                        new ArrayList<>()));
             } else {
                 existing.name = enteredName;
                 existing.detail = enteredDetail;
@@ -366,6 +451,352 @@ public class MainActivity extends Activity {
             dialog.dismiss();
         }));
         dialog.show();
+    }
+
+    private void showServerDialog() {
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(4), dp(10), dp(4), 0);
+
+        TextView helper = text("Use your PC Tailscale address and the bridge token configured on the server.", 14, Color.rgb(77, 88, 78), Typeface.NORMAL);
+        helper.setPadding(0, 0, 0, dp(12));
+        form.addView(helper);
+
+        EditText url = field("Server URL", 1);
+        url.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        url.setText(apiBaseUrl);
+        form.addView(url);
+
+        EditText token = field("Bridge token", 1);
+        token.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        token.setText(apiToken);
+        form.addView(token);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Codex server")
+                .setView(form)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Save", null)
+                .create();
+
+        dialog.setOnShowListener(d -> dialog.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener(v -> {
+            apiBaseUrl = normalizeBaseUrl(url.getText().toString().trim());
+            apiToken = token.getText().toString().trim();
+            if (!apiBaseUrl.isEmpty() && apiToken.isEmpty()) {
+                token.setError("Required");
+                return;
+            }
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit()
+                    .putString(KEY_API_BASE_URL, apiBaseUrl)
+                    .putString(KEY_API_TOKEN, apiToken)
+                    .apply();
+            render();
+            dialog.dismiss();
+            if (!apiBaseUrl.isEmpty()) {
+                fetchRemoteSessions(true);
+            }
+        }));
+        dialog.show();
+    }
+
+    private void fetchRemoteSessions(boolean showToast) {
+        if (apiBaseUrl.isEmpty()) {
+            Toast.makeText(this, "Set server URL first", Toast.LENGTH_SHORT).show();
+            showServerDialog();
+            return;
+        }
+
+        if (showToast) {
+            connectionStatus.setText("Syncing " + apiBaseUrl);
+        }
+        new Thread(() -> {
+            try {
+                List<CodexSession> remote = parseRemoteSessions(httpGet(apiBaseUrl + "/sessions"));
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    sessions.clear();
+                    sessions.addAll(remote);
+                    saveSessions();
+                    activeFilter = FILTER_ALL;
+                    render();
+                    notifyApprovalWaits(remote);
+                    if (showToast) {
+                        Toast.makeText(this, "Synced " + remote.size() + " sessions", Toast.LENGTH_SHORT).show();
+                    }
+                });
+            } catch (Exception error) {
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    render();
+                    if (showToast) {
+                        Toast.makeText(this, "Sync failed: " + error.getMessage(), Toast.LENGTH_LONG).show();
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private List<CodexSession> parseRemoteSessions(String raw) throws JSONException {
+        JSONObject root = new JSONObject(raw);
+        JSONArray array = root.getJSONArray("sessions");
+        List<CodexSession> remote = new ArrayList<>();
+        for (int i = 0; i < array.length(); i++) {
+            JSONObject item = array.getJSONObject(i);
+            remote.add(new CodexSession(
+                    item.optString("id", UUID.randomUUID().toString()),
+                    item.optString("name", "Untitled Codex session"),
+                    item.optString("detail", "No detail provided."),
+                    item.optString("status", STATUS_RUNNING),
+                    item.optString("updatedAt", now()),
+                    item.optBoolean("approvalPending", false),
+                    parseMessages(item.optJSONArray("messages"))));
+        }
+        return remote;
+    }
+
+    private List<CodexMessage> parseMessages(JSONArray array) {
+        List<CodexMessage> messages = new ArrayList<>();
+        if (array == null) {
+            return messages;
+        }
+        for (int i = 0; i < array.length(); i++) {
+            JSONObject item = array.optJSONObject(i);
+            if (item != null) {
+                messages.add(new CodexMessage(
+                        item.optString("time", ""),
+                        item.optString("role", "event"),
+                        item.optString("text", "")));
+            }
+        }
+        return messages;
+    }
+
+    private String normalizeBaseUrl(String value) {
+        if (value.isEmpty()) {
+            return "";
+        }
+        String normalized = value.startsWith("http://") || value.startsWith("https://")
+                ? value
+                : "http://" + value;
+        while (normalized.endsWith("/")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
+    }
+
+    private void showSessionDetail(CodexSession session) {
+        fetchSessionDetail(session, true);
+    }
+
+    private void fetchSessionDetail(CodexSession session, boolean showDialog) {
+        if (apiBaseUrl.isEmpty()) {
+            showLocalSessionDetail(session);
+            return;
+        }
+
+        new Thread(() -> {
+            try {
+                JSONObject root = new JSONObject(httpGet(apiBaseUrl + "/sessions/" + pathSegment(session.id)));
+                CodexSession detailed = parseSingleSession(root.getJSONObject("session"));
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    replaceSession(detailed);
+                    render();
+                    if (showDialog) {
+                        showLocalSessionDetail(detailed);
+                    }
+                });
+            } catch (Exception error) {
+                new Handler(Looper.getMainLooper()).post(() -> showLocalSessionDetail(session));
+            }
+        }).start();
+    }
+
+    private CodexSession parseSingleSession(JSONObject item) {
+        return new CodexSession(
+                item.optString("id", UUID.randomUUID().toString()),
+                item.optString("name", "Untitled Codex session"),
+                item.optString("detail", "No detail provided."),
+                item.optString("status", STATUS_RUNNING),
+                item.optString("updatedAt", now()),
+                item.optBoolean("approvalPending", false),
+                parseMessages(item.optJSONArray("messages")));
+    }
+
+    private void replaceSession(CodexSession updated) {
+        for (int i = 0; i < sessions.size(); i++) {
+            if (sessions.get(i).id.equals(updated.id)) {
+                sessions.set(i, updated);
+                saveSessions();
+                return;
+            }
+        }
+        sessions.add(0, updated);
+        saveSessions();
+    }
+
+    private void showLocalSessionDetail(CodexSession session) {
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(dp(4), dp(8), dp(4), 0);
+        scroll.addView(body);
+
+        TextView meta = text((session.approvalPending ? "Approval waiting\n" : "") + "Updated " + session.updatedAt, 14, Color.rgb(77, 88, 78), Typeface.BOLD);
+        body.addView(meta);
+
+        if (session.messages.isEmpty()) {
+            TextView empty = text(session.detail, 14, Color.rgb(77, 88, 78), Typeface.NORMAL);
+            empty.setPadding(0, dp(12), 0, 0);
+            body.addView(empty);
+        } else {
+            for (CodexMessage message : session.messages) {
+                TextView item = text(message.role + "\n" + message.text, 13, Color.rgb(18, 22, 18), Typeface.NORMAL);
+                item.setPadding(dp(12), dp(10), dp(12), dp(10));
+                item.setBackground(roundRect(Color.rgb(244, 245, 237), dp(14), Color.rgb(212, 217, 205)));
+                LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT);
+                params.setMargins(0, dp(10), 0, 0);
+                body.addView(item, params);
+            }
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle(session.name)
+                .setView(scroll)
+                .setNegativeButton("Close", null)
+                .setPositiveButton("Prompt", (dialog, which) -> showPromptDialog(session))
+                .show();
+    }
+
+    private void showPromptDialog(CodexSession session) {
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(4), dp(10), dp(4), 0);
+
+        TextView helper = text("This queues a prompt on the PC bridge. Direct live injection into Codex is not enabled yet.", 14, Color.rgb(77, 88, 78), Typeface.NORMAL);
+        helper.setPadding(0, 0, 0, dp(12));
+        form.addView(helper);
+
+        EditText prompt = field("Prompt for this session", 5);
+        prompt.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        form.addView(prompt);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Send prompt")
+                .setView(form)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Queue", null)
+                .create();
+
+        dialog.setOnShowListener(d -> dialog.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener(v -> {
+            String text = prompt.getText().toString().trim();
+            if (text.isEmpty()) {
+                prompt.setError("Required");
+                return;
+            }
+            queuePrompt(session, text);
+            dialog.dismiss();
+        }));
+        dialog.show();
+    }
+
+    private void queuePrompt(CodexSession session, String prompt) {
+        if (apiBaseUrl.isEmpty()) {
+            Toast.makeText(this, "Set server URL first", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        new Thread(() -> {
+            try {
+                JSONObject body = new JSONObject();
+                body.put("prompt", prompt);
+                JSONObject response = new JSONObject(httpPost(apiBaseUrl + "/sessions/" + pathSegment(session.id) + "/prompt", body.toString()));
+                boolean sent = response.optBoolean("sent", false);
+                new Handler(Looper.getMainLooper()).post(() ->
+                        Toast.makeText(this, sent ? "Prompt sent via daemon" : "Prompt queued on PC", Toast.LENGTH_SHORT).show());
+            } catch (Exception error) {
+                new Handler(Looper.getMainLooper()).post(() ->
+                        Toast.makeText(this, "Prompt failed: " + error.getMessage(), Toast.LENGTH_LONG).show());
+            }
+        }).start();
+    }
+
+    private void createRemoteSession(String name, String detail) {
+        new Thread(() -> {
+            try {
+                JSONObject body = new JSONObject();
+                body.put("name", name);
+                body.put("detail", detail);
+                body.put("prompt", name + "\n\n" + detail);
+                JSONObject response = new JSONObject(httpPost(apiBaseUrl + "/sessions", body.toString()));
+                boolean created = response.optBoolean("created", false);
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    Toast.makeText(this, created ? "Session created on PC" : "Session queued on PC", Toast.LENGTH_SHORT).show();
+                    fetchRemoteSessions(false);
+                });
+            } catch (Exception error) {
+                new Handler(Looper.getMainLooper()).post(() ->
+                        Toast.makeText(this, "Create failed: " + error.getMessage(), Toast.LENGTH_LONG).show());
+            }
+        }).start();
+    }
+
+    private String httpGet(String urlValue) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(urlValue).openConnection();
+        connection.setConnectTimeout(5000);
+        connection.setReadTimeout(5000);
+        connection.setRequestMethod("GET");
+        applyAuth(connection);
+        return readResponse(connection);
+    }
+
+    private String httpPost(String urlValue, String body) throws Exception {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        HttpURLConnection connection = (HttpURLConnection) new URL(urlValue).openConnection();
+        connection.setConnectTimeout(5000);
+        connection.setReadTimeout(5000);
+        connection.setRequestMethod("POST");
+        connection.setDoOutput(true);
+        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+        connection.setRequestProperty("Content-Length", String.valueOf(bytes.length));
+        applyAuth(connection);
+        OutputStream stream = connection.getOutputStream();
+        stream.write(bytes);
+        stream.close();
+        return readResponse(connection);
+    }
+
+    private String readResponse(HttpURLConnection connection) throws Exception {
+        int code = connection.getResponseCode();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(
+                code >= 200 && code < 300 ? connection.getInputStream() : connection.getErrorStream(),
+                StandardCharsets.UTF_8));
+        StringBuilder body = new StringBuilder();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            body.append(line);
+        }
+        reader.close();
+        connection.disconnect();
+        if (code < 200 || code >= 300) {
+            String message = body.toString();
+            try {
+                JSONObject json = new JSONObject(message);
+                message = json.optString("error", message);
+            } catch (Exception ignored) {
+            }
+            throw new IllegalStateException("HTTP " + code + ": " + message);
+        }
+        return body.toString();
+    }
+
+    private void applyAuth(HttpURLConnection connection) {
+        if (!apiToken.isEmpty()) {
+            connection.setRequestProperty("Authorization", "Bearer " + apiToken);
+        }
+    }
+
+    private String pathSegment(String value) throws Exception {
+        return URLEncoder.encode(value, StandardCharsets.UTF_8.name()).replace("+", "%20");
     }
 
     private void updateStatus(CodexSession session, String status) {
@@ -389,6 +820,66 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    private void createNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            return;
+        }
+        NotificationChannel channel = new NotificationChannel(
+                NOTIFICATION_CHANNEL,
+                "Codex Monitor alerts",
+                NotificationManager.IMPORTANCE_HIGH);
+        channel.setDescription("Approval waiting and session attention alerts");
+        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        manager.createNotificationChannel(channel);
+    }
+
+    private void requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 42);
+        }
+    }
+
+    private void notifyApprovalWaits(List<CodexSession> remote) {
+        for (CodexSession session : remote) {
+            if (session.approvalPending && !notifiedApprovals.contains(session.id)) {
+                notifiedApprovals.add(session.id);
+                showApprovalNotification(session);
+            }
+            if (!session.approvalPending) {
+                notifiedApprovals.remove(session.id);
+            }
+        }
+    }
+
+    private void showApprovalNotification(CodexSession session) {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+
+        Intent intent = new Intent(this, MainActivity.class);
+        intent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent pendingIntent = PendingIntent.getActivity(
+                this,
+                session.id.hashCode(),
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        android.app.Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? new android.app.Notification.Builder(this, NOTIFICATION_CHANNEL)
+                : new android.app.Notification.Builder(this);
+        builder.setSmallIcon(android.R.drawable.stat_sys_warning)
+                .setContentTitle("Codex approval waiting")
+                .setContentText(session.name)
+                .setStyle(new android.app.Notification.BigTextStyle().bigText(session.detail))
+                .setContentIntent(pendingIntent)
+                .setAutoCancel(true);
+
+        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        manager.notify(session.id.hashCode(), builder.build());
+    }
+
     private void loadSessions() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String raw = prefs.getString(KEY_SESSIONS, "[]");
@@ -402,7 +893,9 @@ public class MainActivity extends Activity {
                         item.optString("name", "Untitled"),
                         item.optString("detail", "No detail provided."),
                         item.optString("status", STATUS_RUNNING),
-                        item.optString("updatedAt", now())));
+                        item.optString("updatedAt", now()),
+                        item.optBoolean("approvalPending", false),
+                        parseMessages(item.optJSONArray("messages"))));
             }
         } catch (JSONException ignored) {
             sessions.clear();
@@ -419,6 +912,16 @@ public class MainActivity extends Activity {
                 item.put("detail", session.detail);
                 item.put("status", session.status);
                 item.put("updatedAt", session.updatedAt);
+                item.put("approvalPending", session.approvalPending);
+                JSONArray messages = new JSONArray();
+                for (CodexMessage message : session.messages) {
+                    JSONObject messageJson = new JSONObject();
+                    messageJson.put("time", message.time);
+                    messageJson.put("role", message.role);
+                    messageJson.put("text", message.text);
+                    messages.put(messageJson);
+                }
+                item.put("messages", messages);
                 array.put(item);
             } catch (JSONException ignored) {
                 // JSONObject only receives primitive strings here.
@@ -436,19 +939,25 @@ public class MainActivity extends Activity {
                 "Android UI refresh",
                 "Build a polished local dashboard before wiring real Codex telemetry.",
                 STATUS_RUNNING,
-                now()));
+                now(),
+                false,
+                new ArrayList<>()));
         sessions.add(new CodexSession(
                 UUID.randomUUID().toString(),
                 "Desktop bridge",
                 "Decide whether Android should poll an API or receive push events from a companion service.",
                 STATUS_BLOCKED,
-                now()));
+                now(),
+                false,
+                new ArrayList<>()));
         sessions.add(new CodexSession(
                 UUID.randomUUID().toString(),
                 "Local persistence",
                 "Session cards survive app restarts using SharedPreferences.",
                 STATUS_DONE,
-                now()));
+                now(),
+                false,
+                new ArrayList<>()));
         saveSessions();
     }
 
@@ -516,6 +1025,22 @@ public class MainActivity extends Activity {
         action.setBackground(roundRect(Color.rgb(18, 28, 22), dp(14), Color.rgb(48, 66, 54)));
         action.setOnClickListener(v -> onClick.run());
         return action;
+    }
+
+    private TextView smallButton(String label, int color) {
+        TextView button = text(label, 12, color, Typeface.BOLD);
+        button.setGravity(Gravity.CENTER);
+        button.setPadding(dp(10), dp(8), dp(10), dp(8));
+        button.setBackground(roundRect(Color.rgb(18, 28, 22), dp(14), Color.rgb(48, 66, 54)));
+        return button;
+    }
+
+    private LinearLayout.LayoutParams compactButtonParams(boolean hasRightGap) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.setMargins(0, 0, hasRightGap ? dp(7) : 0, 0);
+        return params;
     }
 
     private LinearLayout.LayoutParams actionParams(boolean hasRightGap) {
@@ -601,13 +1126,29 @@ public class MainActivity extends Activity {
         String detail;
         String status;
         String updatedAt;
+        boolean approvalPending;
+        List<CodexMessage> messages;
 
-        CodexSession(String id, String name, String detail, String status, String updatedAt) {
+        CodexSession(String id, String name, String detail, String status, String updatedAt, boolean approvalPending, List<CodexMessage> messages) {
             this.id = id;
             this.name = name;
             this.detail = detail;
             this.status = status;
             this.updatedAt = updatedAt;
+            this.approvalPending = approvalPending;
+            this.messages = messages;
+        }
+    }
+
+    private static class CodexMessage {
+        final String time;
+        final String role;
+        final String text;
+
+        CodexMessage(String time, String role, String text) {
+            this.time = time;
+            this.role = role;
+            this.text = text;
         }
     }
 }
