@@ -1,5 +1,6 @@
 plugins {
     id "com.android.application"
+    id "maven-publish"
 }
 
 android {
@@ -12,5 +13,40 @@ android {
         targetSdk 35
         versionCode 1
         versionName "0.1.0"
+    }
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            codexMonitorApk(MavenPublication) {
+                groupId = "io.github.te9no"
+                artifactId = "codex-monitor-android"
+                version = System.getenv("PACKAGE_VERSION") ?: android.defaultConfig.versionName
+
+                artifact("$buildDir/outputs/apk/debug/app-debug.apk") {
+                    extension = "apk"
+                    classifier = "debug"
+                    builtBy tasks.named("assembleDebug")
+                }
+
+                pom {
+                    name = "Codex Monitor Android"
+                    description = "Android client for viewing Codex Monitor sessions and sending prompts through a PC bridge."
+                    url = "https://github.com/te9no/codexmonitorandroid"
+                }
+            }
+        }
+
+        repositories {
+            maven {
+                name = "GitHubPackages"
+                url = uri("https://maven.pkg.github.com/te9no/codexmonitorandroid")
+                credentials {
+                    username = System.getenv("GITHUB_ACTOR") ?: ""
+                    password = System.getenv("GITHUB_TOKEN") ?: ""
+                }
+            }
+        }
     }
 }

@@ -427,3 +427,23 @@ git push origin v0.1.0
 ```
 
 生成されるAPKはプレビュー配布用です。本番配布する場合は、正式なAndroid署名設定を追加し、署名情報をGitHub Actions secretsに保存してください。
+
+### GitHub Packages
+
+The workflow also publishes the APK to GitHub Packages as a Maven package:
+
+```text
+io.github.te9no:codex-monitor-android:<version>:debug@apk
+```
+
+Tag builds publish automatically. To publish an already released version from the current workflow, run `Android CI` manually with `package_version` set to the desired version, for example `0.1.0`.
+
+### GitHub Packages
+
+workflowはAPKをMaven packageとしてGitHub Packagesにも公開します。
+
+```text
+io.github.te9no:codex-monitor-android:<version>:debug@apk
+```
+
+タグビルドでは自動公開されます。既存リリースを現在のworkflowから公開したい場合は、`Android CI` を手動実行し、`package_version` に `0.1.0` のようなバージョンを指定してください。
