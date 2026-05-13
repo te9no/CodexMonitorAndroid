@@ -393,3 +393,37 @@ PowerShellで日本語が文字化けする
 ```powershell
 Get-Content $HOME\.codex\monitor_prompts.jsonl -Encoding utf8
 ```
+
+### GitHub Actions Release
+
+This repository includes a GitHub Actions workflow at `.github/workflows/android.yml`.
+
+- Pushes and pull requests to `main` run lint and build checks.
+- Tags matching `v*` build an installable debug-signed APK and publish it to a GitHub Release.
+- The release also includes a SHA-256 checksum file.
+
+Create a release by pushing a version tag:
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The generated APK is intended as a preview package. For production distribution, add a proper Android signing configuration and store signing credentials in GitHub Actions secrets.
+
+### GitHub Actionsでのリリース
+
+このリポジトリには `.github/workflows/android.yml` のGitHub Actions workflowがあります。
+
+- `main` へのpushとpull requestでlintとビルドを実行します。
+- `v*` に一致するタグをpushすると、インストール可能なdebug署名APKをビルドしてGitHub Releaseへ添付します。
+- SHA-256チェックサムも一緒に添付します。
+
+リリースを作成するには、バージョンタグをpushします。
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+生成されるAPKはプレビュー配布用です。本番配布する場合は、正式なAndroid署名設定を追加し、署名情報をGitHub Actions secretsに保存してください。
