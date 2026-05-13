@@ -447,3 +447,23 @@ io.github.te9no:codex-monitor-android:<version>:debug@apk
 ```
 
 タグビルドでは自動公開されます。既存リリースを現在のworkflowから公開したい場合は、`Android CI` を手動実行し、`package_version` に `0.1.0` のようなバージョンを指定してください。
+
+### Install Error: Existing Debug Build
+
+If Android says the app cannot be installed when using a Release APK, uninstall any locally built debug version first. Android does not allow updating an installed app with another APK signed by a different key.
+
+```powershell
+adb uninstall com.example.codexmonitor
+```
+
+After installing a signed Release APK once, future Release APKs from this repository should update normally as long as the same release signing key is used.
+
+### インストールエラー: 既存debug版がある場合
+
+Release APKのインストール時にAndroid側で失敗する場合、先にローカルdebugビルド版をアンインストールしてください。Androidは署名鍵が違うAPKで既存アプリを上書きできません。
+
+```powershell
+adb uninstall com.example.codexmonitor
+```
+
+一度署名済みRelease APKをインストールした後は、同じrelease署名鍵で作られたAPKなら通常通り更新できます。

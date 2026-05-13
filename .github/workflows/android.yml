@@ -44,8 +44,21 @@ jobs:
       - name: Lint
         run: ./gradlew app:lintDebug
 
-      - name: Build debug APK
-        run: ./gradlew assembleDebug
+      - name: Decode release signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [[ -n "${ANDROID_KEYSTORE_BASE64}" ]]; then
+            echo "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > "${RUNNER_TEMP}/release.keystore"
+          fi
+
+      - name: Build release APK
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/release.keystore
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease
 
       - name: Prepare APK artifact
         shell: bash
@@ -56,7 +69,7 @@ jobs:
           else
             VERSION="${GITHUB_SHA::7}"
           fi
-          cp app/build/outputs/apk/debug/app-debug.apk "dist/codex-monitor-android-${VERSION}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "dist/codex-monitor-android-${VERSION}.apk"
           sha256sum "dist/codex-monitor-android-${VERSION}.apk" > "dist/codex-monitor-android-${VERSION}.apk.sha256"
 
       - name: Upload build artifact
@@ -84,6 +97,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PACKAGE_VERSION: ${{ github.event.inputs.package_version != '' && github.event.inputs.package_version || github.ref_name }}
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/release.keystore
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         shell: bash
         run: |
           PACKAGE_VERSION="${PACKAGE_VERSION#v}"
