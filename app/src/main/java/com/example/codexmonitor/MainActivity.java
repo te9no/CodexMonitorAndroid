@@ -45,8 +45,10 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.HashSet;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -83,6 +85,7 @@ public class MainActivity extends Activity {
     private TextView summary;
     private TextView countBadge;
     private TextView connectionStatus;
+    private TextView backendStatus;
     private String activeFilter = FILTER_ALL;
     private String apiBaseUrl = "";
     private String apiToken = "";
@@ -231,6 +234,10 @@ public class MainActivity extends Activity {
 
         hero.addView(connectionRow);
 
+        backendStatus = text("Remote backend not checked yet.", 12, muted, Typeface.BOLD);
+        backendStatus.setPadding(0, dp(10), 0, 0);
+        hero.addView(backendStatus);
+
         return hero;
     }
 
@@ -243,6 +250,7 @@ public class MainActivity extends Activity {
         summary.setText("Tap a status pill to triage work. Use filters to focus on what needs attention.");
         if (apiBaseUrl.isEmpty()) {
             connectionStatus.setText("Manual mode. Set Tailscale server URL.");
+            backendStatus.setText("Remote backend not configured.");
         } else {
             connectionStatus.setText("Server " + apiBaseUrl);
         }
@@ -270,20 +278,80 @@ public class MainActivity extends Activity {
     private void renderSessions() {
         list.removeAllViews();
         int shown = 0;
-        for (CodexSession session : sessions) {
-            if (FILTER_ALL.equals(activeFilter) || activeFilter.equals(session.status)) {
+        Map<String, List<CodexSession>> groups = groupedVisibleSessions();
+        for (Map.Entry<String, List<CodexSession>> entry : groups.entrySet()) {
+            list.addView(groupHeader(entry.getKey(), entry.getValue()));
+            int groupShown = 0;
+            for (CodexSession session : entry.getValue()) {
                 View card = card(session);
                 card.setAlpha(0f);
                 card.setTranslationY(dp(10));
                 card.animate().alpha(1f).translationY(0f).setDuration(180L + (shown * 35L)).start();
                 list.addView(card);
                 shown++;
+                groupShown++;
+            }
+            if (groupShown == 0) {
+                continue;
             }
         }
 
         if (shown == 0) {
             list.addView(emptyState());
         }
+    }
+
+    private Map<String, List<CodexSession>> groupedVisibleSessions() {
+        Map<String, List<CodexSession>> groups = new LinkedHashMap<>();
+        for (CodexSession session : sessions) {
+            if (FILTER_ALL.equals(activeFilter) || activeFilter.equals(session.status)) {
+                String group = session.groupName == null || session.groupName.isEmpty()
+                        ? "Ungrouped"
+                        : session.groupName;
+                if (!groups.containsKey(group)) {
+                    groups.put(group, new ArrayList<>());
+                }
+                groups.get(group).add(session);
+            }
+        }
+        return groups;
+    }
+
+    private View groupHeader(String groupName, List<CodexSession> grouped) {
+        int active = 0;
+        int blockedCount = 0;
+        for (CodexSession session : grouped) {
+            if (STATUS_RUNNING.equals(session.status)) {
+                active++;
+            }
+            if (STATUS_BLOCKED.equals(session.status)) {
+                blockedCount++;
+            }
+        }
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setPadding(dp(12), dp(8), dp(12), dp(8));
+        header.setBackground(roundRect(Color.rgb(18, 29, 23), dp(18), Color.rgb(48, 66, 54)));
+
+        TextView title = text(groupName, 15, textPrimary, Typeface.BOLD);
+        header.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        String countText = String.format(Locale.US, "%d sessions", grouped.size());
+        if (blockedCount > 0) {
+            countText += String.format(Locale.US, " / %d blocked", blockedCount);
+        } else if (active > 0) {
+            countText += String.format(Locale.US, " / %d active", active);
+        }
+        TextView count = text(countText, 12, textSecondary, Typeface.BOLD);
+        header.addView(count);
+
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.setMargins(0, dp(10), 0, dp(8));
+        header.setLayoutParams(params);
+        return header;
     }
 
     private View card(CodexSession session) {
@@ -312,6 +380,13 @@ public class MainActivity extends Activity {
         TextView updated = text("Updated " + session.updatedAt, 12, muted, Typeface.NORMAL);
         updated.setPadding(0, dp(4), 0, 0);
         titleBlock.addView(updated);
+
+        if (session.daemonKnown) {
+            TextView daemon = text(session.daemonConnected ? "daemon connected" : "daemon not connected", 12,
+                    session.daemonConnected ? running : muted, Typeface.BOLD);
+            daemon.setPadding(0, dp(4), 0, 0);
+            titleBlock.addView(daemon);
+        }
 
         top.addView(titleBlock, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
@@ -439,7 +514,11 @@ public class MainActivity extends Activity {
                         status.getSelectedItem().toString(),
                         now(),
                         false,
-                        new ArrayList<>()));
+                        new ArrayList<>(),
+                        "Manual",
+                        "",
+                        false,
+                        false));
             } else {
                 existing.name = enteredName;
                 existing.detail = enteredDetail;
@@ -508,13 +587,22 @@ public class MainActivity extends Activity {
         }
         new Thread(() -> {
             try {
-                List<CodexSession> remote = parseRemoteSessions(httpGet(apiBaseUrl + "/sessions"));
+                String sessionsRaw = httpGet(apiBaseUrl + "/sessions");
+                String daemonRaw = "";
+                try {
+                    daemonRaw = httpGet(apiBaseUrl + "/daemon");
+                } catch (Exception ignored) {
+                    // Session sync should still work even if daemon status is unavailable.
+                }
+                List<CodexSession> remote = parseRemoteSessions(sessionsRaw);
+                String backend = parseBackendStatus(daemonRaw);
                 new Handler(Looper.getMainLooper()).post(() -> {
                     sessions.clear();
                     sessions.addAll(remote);
                     saveSessions();
                     activeFilter = FILTER_ALL;
                     render();
+                    backendStatus.setText(backend);
                     notifyApprovalWaits(remote);
                     if (showToast) {
                         Toast.makeText(this, "Synced " + remote.size() + " sessions", Toast.LENGTH_SHORT).show();
@@ -523,6 +611,7 @@ public class MainActivity extends Activity {
             } catch (Exception error) {
                 new Handler(Looper.getMainLooper()).post(() -> {
                     render();
+                    backendStatus.setText("Remote backend check failed.");
                     if (showToast) {
                         Toast.makeText(this, "Sync failed for " + apiBaseUrl + ": " + error.getMessage(), Toast.LENGTH_LONG).show();
                     }
@@ -544,9 +633,61 @@ public class MainActivity extends Activity {
                     item.optString("status", STATUS_RUNNING),
                     item.optString("updatedAt", now()),
                     item.optBoolean("approvalPending", false),
-                    parseMessages(item.optJSONArray("messages"))));
+                    parseMessages(item.optJSONArray("messages")),
+                    sessionGroup(item),
+                    item.optString("cwd", ""),
+                    item.has("daemonConnected"),
+                    item.optBoolean("daemonConnected", false)));
         }
         return remote;
+    }
+
+    private String parseBackendStatus(String raw) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return "Remote backend status unavailable.";
+        }
+        try {
+            JSONObject daemon = new JSONObject(raw).getJSONObject("daemon");
+            boolean enabled = daemon.optBoolean("enabled", false);
+            boolean connected = daemon.optBoolean("connected", false);
+            if (!enabled) {
+                return "Remote backend: disabled on PC bridge.";
+            }
+            if (connected) {
+                JSONArray workspaces = daemon.optJSONArray("workspaces");
+                int total = workspaces == null ? 0 : workspaces.length();
+                int connectedCount = 0;
+                if (workspaces != null) {
+                    for (int i = 0; i < workspaces.length(); i++) {
+                        JSONObject workspace = workspaces.optJSONObject(i);
+                        if (workspace != null && workspace.optBoolean("connected", false)) {
+                            connectedCount++;
+                        }
+                    }
+                }
+                return String.format(Locale.US, "Remote backend: connected (%d/%d workspaces).", connectedCount, total);
+            }
+            return "Remote backend: " + daemon.optString("error", "not connected");
+        } catch (Exception ignored) {
+            return "Remote backend status unavailable.";
+        }
+    }
+
+    private String sessionGroup(JSONObject item) {
+        String cwd = item.optString("cwd", "");
+        if (!cwd.isEmpty()) {
+            String normalized = cwd.replace('\\', '/');
+            while (normalized.endsWith("/")) {
+                normalized = normalized.substring(0, normalized.length() - 1);
+            }
+            int slash = normalized.lastIndexOf('/');
+            if (slash >= 0 && slash < normalized.length() - 1) {
+                return normalized.substring(slash + 1);
+            }
+            return normalized;
+        }
+        String name = item.optString("name", "").trim();
+        return name.isEmpty() ? "Ungrouped" : name;
     }
 
     private List<CodexMessage> parseMessages(JSONArray array) {
@@ -614,7 +755,11 @@ public class MainActivity extends Activity {
                 item.optString("status", STATUS_RUNNING),
                 item.optString("updatedAt", now()),
                 item.optBoolean("approvalPending", false),
-                parseMessages(item.optJSONArray("messages")));
+                parseMessages(item.optJSONArray("messages")),
+                sessionGroup(item),
+                item.optString("cwd", ""),
+                item.has("daemonConnected"),
+                item.optBoolean("daemonConnected", false));
     }
 
     private void replaceSession(CodexSession updated) {
@@ -636,7 +781,16 @@ public class MainActivity extends Activity {
         body.setPadding(dp(4), dp(8), dp(4), 0);
         scroll.addView(body);
 
-        TextView meta = text((session.approvalPending ? "Approval waiting\n" : "") + "Updated " + session.updatedAt, 14, Color.rgb(77, 88, 78), Typeface.BOLD);
+        String metaText = (session.approvalPending ? "Approval waiting\n" : "")
+                + "Updated " + session.updatedAt
+                + "\nGroup " + session.groupName;
+        if (!session.cwd.isEmpty()) {
+            metaText += "\nWorkspace " + session.cwd;
+        }
+        if (session.daemonKnown) {
+            metaText += "\nDaemon " + (session.daemonConnected ? "connected" : "not connected");
+        }
+        TextView meta = text(metaText, 14, Color.rgb(77, 88, 78), Typeface.BOLD);
         body.addView(meta);
 
         if (session.messages.isEmpty()) {
@@ -681,7 +835,7 @@ public class MainActivity extends Activity {
                 .setTitle("Send prompt")
                 .setView(form)
                 .setNegativeButton("Cancel", null)
-                .setPositiveButton("Queue", null)
+                .setPositiveButton("Send", null)
                 .create();
 
         dialog.setOnShowListener(d -> dialog.getButton(DialogInterface.BUTTON_POSITIVE).setOnClickListener(v -> {
@@ -703,17 +857,39 @@ public class MainActivity extends Activity {
         }
         new Thread(() -> {
             try {
-                JSONObject body = new JSONObject();
-                body.put("prompt", prompt);
-                JSONObject response = new JSONObject(httpPost(apiBaseUrl + "/sessions/" + pathSegment(session.id) + "/prompt", body.toString()));
+                JSONObject response = postPromptWithFallback(session, prompt);
                 boolean sent = response.optBoolean("sent", false);
+                boolean queued = response.optBoolean("queued", false);
+                String message = sent
+                        ? "Prompt sent via daemon"
+                        : queued ? "Prompt queued on PC" : "Prompt accepted by PC bridge";
                 new Handler(Looper.getMainLooper()).post(() ->
-                        Toast.makeText(this, sent ? "Prompt sent via daemon" : "Prompt queued on PC", Toast.LENGTH_SHORT).show());
+                        Toast.makeText(this, message, Toast.LENGTH_SHORT).show());
             } catch (Exception error) {
                 new Handler(Looper.getMainLooper()).post(() ->
                         Toast.makeText(this, "Prompt failed: " + error.getMessage(), Toast.LENGTH_LONG).show());
             }
         }).start();
+    }
+
+    private JSONObject postPromptWithFallback(CodexSession session, String prompt) throws Exception {
+        JSONObject body = new JSONObject();
+        body.put("prompt", prompt);
+        body.put("name", session.name);
+        body.put("detail", session.detail);
+        try {
+            return new JSONObject(httpPost(apiBaseUrl + "/sessions/" + pathSegment(session.id) + "/prompt", body.toString()));
+        } catch (IllegalStateException error) {
+            String message = error.getMessage() == null ? "" : error.getMessage();
+            if (!message.contains("HTTP 404")) {
+                throw error;
+            }
+            JSONObject fallback = new JSONObject();
+            fallback.put("name", session.name);
+            fallback.put("detail", session.detail);
+            fallback.put("prompt", prompt);
+            return new JSONObject(httpPost(apiBaseUrl + "/sessions", fallback.toString()));
+        }
     }
 
     private void createRemoteSession(String name, String detail) {
@@ -891,7 +1067,11 @@ public class MainActivity extends Activity {
                         item.optString("status", STATUS_RUNNING),
                         item.optString("updatedAt", now()),
                         item.optBoolean("approvalPending", false),
-                        parseMessages(item.optJSONArray("messages"))));
+                        parseMessages(item.optJSONArray("messages")),
+                        item.optString("groupName", item.optString("name", "Ungrouped")),
+                        item.optString("cwd", ""),
+                        item.has("daemonConnected"),
+                        item.optBoolean("daemonConnected", false)));
             }
         } catch (JSONException ignored) {
             sessions.clear();
@@ -909,6 +1089,9 @@ public class MainActivity extends Activity {
                 item.put("status", session.status);
                 item.put("updatedAt", session.updatedAt);
                 item.put("approvalPending", session.approvalPending);
+                item.put("groupName", session.groupName);
+                item.put("cwd", session.cwd);
+                item.put("daemonConnected", session.daemonConnected);
                 JSONArray messages = new JSONArray();
                 for (CodexMessage message : session.messages) {
                     JSONObject messageJson = new JSONObject();
@@ -937,7 +1120,11 @@ public class MainActivity extends Activity {
                 STATUS_RUNNING,
                 now(),
                 false,
-                new ArrayList<>()));
+                new ArrayList<>(),
+                "Examples",
+                "",
+                false,
+                false));
         sessions.add(new CodexSession(
                 UUID.randomUUID().toString(),
                 "Desktop bridge",
@@ -945,7 +1132,11 @@ public class MainActivity extends Activity {
                 STATUS_BLOCKED,
                 now(),
                 false,
-                new ArrayList<>()));
+                new ArrayList<>(),
+                "Examples",
+                "",
+                false,
+                false));
         sessions.add(new CodexSession(
                 UUID.randomUUID().toString(),
                 "Local persistence",
@@ -953,7 +1144,11 @@ public class MainActivity extends Activity {
                 STATUS_DONE,
                 now(),
                 false,
-                new ArrayList<>()));
+                new ArrayList<>(),
+                "Examples",
+                "",
+                false,
+                false));
         saveSessions();
     }
 
@@ -1124,8 +1319,12 @@ public class MainActivity extends Activity {
         String updatedAt;
         boolean approvalPending;
         List<CodexMessage> messages;
+        String groupName;
+        String cwd;
+        boolean daemonKnown;
+        boolean daemonConnected;
 
-        CodexSession(String id, String name, String detail, String status, String updatedAt, boolean approvalPending, List<CodexMessage> messages) {
+        CodexSession(String id, String name, String detail, String status, String updatedAt, boolean approvalPending, List<CodexMessage> messages, String groupName, String cwd, boolean daemonKnown, boolean daemonConnected) {
             this.id = id;
             this.name = name;
             this.detail = detail;
@@ -1133,6 +1332,10 @@ public class MainActivity extends Activity {
             this.updatedAt = updatedAt;
             this.approvalPending = approvalPending;
             this.messages = messages;
+            this.groupName = groupName == null || groupName.isEmpty() ? "Ungrouped" : groupName;
+            this.cwd = cwd == null ? "" : cwd;
+            this.daemonKnown = daemonKnown;
+            this.daemonConnected = daemonConnected;
         }
     }
 

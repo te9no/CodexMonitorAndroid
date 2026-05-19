@@ -7,3 +7,5 @@ captures/
 app/build/
 __pycache__/
 *.pyc
+dist/
+*.spec

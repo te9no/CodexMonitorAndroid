@@ -106,3 +106,61 @@ jobs:
           PACKAGE_VERSION="${PACKAGE_VERSION#v}"
           echo "Publishing package version ${PACKAGE_VERSION}"
           PACKAGE_VERSION="${PACKAGE_VERSION}" ./gradlew publishCodexMonitorApkPublicationToGitHubPackagesRepository
+
+  windows-bridge:
+    name: Build Windows bridge
+    needs: build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pyinstaller
+
+      - name: Build bridge EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller `
+            --onefile `
+            --windowed `
+            --name codex-monitor-bridge `
+            --paths tools `
+            tools/codex_monitor_bridge_launcher.py
+
+      - name: Prepare bridge artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          if ("${env:GITHUB_REF_TYPE}" -eq "tag") {
+            $version = "${env:GITHUB_REF_NAME}"
+          } else {
+            $version = "${env:GITHUB_SHA}".Substring(0, 7)
+          }
+          Copy-Item dist\codex-monitor-bridge.exe "dist\codex-monitor-bridge-$version.exe"
+          Get-FileHash "dist\codex-monitor-bridge-$version.exe" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  codex-monitor-bridge-$version.exe" } |
+            Set-Content -Path "dist\codex-monitor-bridge-$version.exe.sha256" -Encoding ascii
+
+      - name: Upload bridge artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-monitor-windows-bridge
+          path: |
+            dist/codex-monitor-bridge-*.exe
+            dist/codex-monitor-bridge-*.exe.sha256
+
+      - name: Add bridge EXE to GitHub Release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = Get-ChildItem -Path dist -File -Filter 'codex-monitor-bridge-*' | ForEach-Object { $_.FullName }
+          gh release upload "${env:GITHUB_REF_NAME}" @files --clobber
