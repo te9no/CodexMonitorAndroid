@@ -10,6 +10,7 @@ import os
 import socket
 import itertools
 import ssl
+import threading
 
 DAEMON_HOST = os.environ.get('CODEX_MONITOR_DAEMON_HOST', '127.0.0.1')
 DAEMON_PORT = int(os.environ.get('CODEX_MONITOR_DAEMON_PORT', '4732'))
@@ -18,6 +19,7 @@ ENABLE_DAEMON = os.environ.get('CODEX_MONITOR_ENABLE_DAEMON', '').lower() in ('1
 ENABLE_DAEMON_SEND = os.environ.get('CODEX_MONITOR_ENABLE_DAEMON_SEND', '').lower() in ('1', 'true', 'yes')
 ALLOW_PROMPT_QUEUE = os.environ.get('CODEX_MONITOR_ALLOW_PROMPT_QUEUE', '').lower() in ('1', 'true', 'yes')
 _rpc_ids = itertools.count(1)
+_queue_lock = threading.Lock()
 
 
 def daemon_rpc(method, params=None, timeout=5):
@@ -318,14 +320,88 @@ def queue_prompt(codex_home: Path, item):
     item.setdefault('status', 'queued')
     item.setdefault('daemon', daemon_execution_disabled())
     path = prompt_queue_path(codex_home)
-    if path.exists() and path.stat().st_size > 0:
-        with path.open('rb+') as handle:
-            handle.seek(-1, os.SEEK_END)
-            if handle.read(1) != b'\n':
-                handle.write(b'\n')
-    with path.open('a', encoding='utf-8', newline='\n') as handle:
-        handle.write(json.dumps(item, ensure_ascii=False) + '\n')
+    with _queue_lock:
+        if path.exists() and path.stat().st_size > 0:
+            with path.open('rb+') as handle:
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b'\n':
+                    handle.write(b'\n')
+        with path.open('a', encoding='utf-8', newline='\n') as handle:
+            handle.write(json.dumps(item, ensure_ascii=False) + '\n')
     return item
+
+
+def read_prompt_queue(codex_home: Path):
+    path = prompt_queue_path(codex_home)
+    if not path.exists():
+        return []
+    items = []
+    with _queue_lock:
+        with path.open('r', encoding='utf-8-sig', errors='replace') as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    items.append(json.loads(line))
+                except Exception:
+                    items.append({'status': 'invalid', 'raw': line})
+    recovered = []
+    for item in items:
+        if item.get('status') == 'invalid' and item.get('raw'):
+            try:
+                recovered.append(json.loads(str(item['raw']).lstrip('\ufeff')))
+                continue
+            except Exception:
+                pass
+        recovered.append(item)
+    return recovered
+
+
+def write_prompt_queue(codex_home: Path, items):
+    path = prompt_queue_path(codex_home)
+    with _queue_lock:
+        with path.open('w', encoding='utf-8', newline='\n') as handle:
+            for item in items:
+                handle.write(json.dumps(item, ensure_ascii=False) + '\n')
+
+
+def drain_prompt_queue(codex_home: Path, limit=10):
+    items = read_prompt_queue(codex_home)
+    if not items:
+        return {'attempted': 0, 'sent': 0, 'remaining': 0}
+
+    attempted = 0
+    sent = 0
+    for item in items:
+        if attempted >= limit:
+            break
+        if item.get('status') != 'queued':
+            continue
+        session_id = str(item.get('sessionId') or '').strip()
+        prompt = str(item.get('prompt') or '').strip()
+        session_file = str(item.get('sessionFile') or '').strip()
+        if not session_id or not prompt or not session_file:
+            continue
+        file = Path(session_file)
+        if not file.exists():
+            item['daemon'] = {'sent': False, 'error': 'queued session file not found'}
+            item['lastAttemptAt'] = datetime.now().isoformat(timespec='seconds')
+            attempted += 1
+            continue
+
+        result = try_send_prompt_via_daemon(session_id, file, prompt)
+        item['daemon'] = result
+        item['lastAttemptAt'] = datetime.now().isoformat(timespec='seconds')
+        attempted += 1
+        if result.get('sent'):
+            item['status'] = 'sent'
+            item['sentAt'] = datetime.now().isoformat(timespec='seconds')
+            sent += 1
+
+    write_prompt_queue(codex_home, items)
+    remaining = sum(1 for item in items if item.get('status') == 'queued')
+    return {'attempted': attempted, 'sent': sent, 'remaining': remaining}
 
 
 def daemon_execution_disabled():

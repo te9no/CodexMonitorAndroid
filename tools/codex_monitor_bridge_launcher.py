@@ -140,6 +140,7 @@ class BridgeApp:
         self.server_thread: threading.Thread | None = None
         self.stopping = False
         self.status_refresh_running = False
+        self.queue_drain_running = False
 
         self.root = Tk()
         self.root.title('Codex Monitor Bridge')
@@ -157,6 +158,7 @@ class BridgeApp:
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
         self.root.after(150, self.start_server)
         self.root.after(500, self.refresh_daemon_status)
+        self.root.after(3000, self.drain_prompt_queue)
 
     def android_url(self) -> str:
         return f'http://{suggested_host()}:{self.port}'
@@ -306,6 +308,29 @@ class BridgeApp:
             self.daemon_status.set(f'Error: {status.get("error", "unknown")}'[:140])
             self.log(f'Daemon error: {status.get("error", "unknown")}')
         self.root.after(10000, self.refresh_daemon_status)
+
+    def drain_prompt_queue(self) -> None:
+        if self.queue_drain_running:
+            return
+        self.queue_drain_running = True
+
+        def worker() -> None:
+            self.configure_server_module()
+            result = codex_monitor_server.drain_prompt_queue(codex_monitor_server.Handler.codex_home)
+            self.root.after(0, lambda: self.apply_queue_drain_result(result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_queue_drain_result(self, result: dict) -> None:
+        self.queue_drain_running = False
+        attempted = int(result.get('attempted') or 0)
+        sent = int(result.get('sent') or 0)
+        remaining = int(result.get('remaining') or 0)
+        if sent:
+            self.log(f'Prompt queue: sent {sent}, remaining {remaining}.')
+        elif attempted:
+            self.log(f'Prompt queue: attempted {attempted}, no sends yet, remaining {remaining}.')
+        self.root.after(10000, self.drain_prompt_queue)
 
     def copy_url(self) -> None:
         self.root.clipboard_clear()

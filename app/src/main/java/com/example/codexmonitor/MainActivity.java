@@ -18,6 +18,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
@@ -82,6 +83,7 @@ public class MainActivity extends Activity {
     private LinearLayout list;
     private LinearLayout filterRow;
     private LinearLayout statsRow;
+    private ScrollView sessionScroll;
     private TextView summary;
     private TextView countBadge;
     private TextView connectionStatus;
@@ -89,8 +91,14 @@ public class MainActivity extends Activity {
     private String activeFilter = FILTER_ALL;
     private String apiBaseUrl = "";
     private String apiToken = "";
+    private float pullStartY = 0f;
+    private boolean pullRefreshReady = false;
+    private boolean detailDialogShowing = false;
+    private boolean promptDialogShowing = false;
+    private String loadingDetailSessionId = "";
     private final Handler refreshHandler = new Handler(Looper.getMainLooper());
     private final Set<String> notifiedApprovals = new HashSet<>();
+    private final Set<String> collapsedGroups = new HashSet<>();
     private final Runnable autoRefresh = new Runnable() {
         @Override
         public void run() {
@@ -151,14 +159,15 @@ public class MainActivity extends Activity {
         filterRow.setPadding(0, dp(4), 0, dp(10));
         root.addView(filterRow);
 
-        ScrollView scroll = new ScrollView(this);
-        scroll.setClipToPadding(false);
-        scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
-        scroll.setPadding(0, 0, 0, dp(94));
+        sessionScroll = new ScrollView(this);
+        sessionScroll.setClipToPadding(false);
+        sessionScroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        sessionScroll.setPadding(0, 0, 0, dp(94));
+        sessionScroll.setOnTouchListener(this::handlePullToRefresh);
         list = new LinearLayout(this);
         list.setOrientation(LinearLayout.VERTICAL);
-        scroll.addView(list);
-        root.addView(scroll, new LinearLayout.LayoutParams(
+        sessionScroll.addView(list);
+        root.addView(sessionScroll, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 0,
                 1f));
@@ -175,6 +184,34 @@ public class MainActivity extends Activity {
         shell.addView(fab, fabParams);
 
         return shell;
+    }
+
+    private boolean handlePullToRefresh(View view, MotionEvent event) {
+        if (apiBaseUrl.isEmpty()) {
+            return false;
+        }
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                pullStartY = event.getY();
+                pullRefreshReady = false;
+                break;
+            case MotionEvent.ACTION_MOVE:
+                if (sessionScroll.getScrollY() == 0 && event.getY() - pullStartY > dp(72)) {
+                    pullRefreshReady = true;
+                    connectionStatus.setText("Release to sync");
+                }
+                break;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                if (pullRefreshReady && sessionScroll.getScrollY() == 0) {
+                    pullRefreshReady = false;
+                    fetchRemoteSessions(true);
+                }
+                break;
+            default:
+                break;
+        }
+        return false;
     }
 
     private View hero() {
@@ -278,9 +315,15 @@ public class MainActivity extends Activity {
     private void renderSessions() {
         list.removeAllViews();
         int shown = 0;
+        int renderedGroups = 0;
         Map<String, List<CodexSession>> groups = groupedVisibleSessions();
         for (Map.Entry<String, List<CodexSession>> entry : groups.entrySet()) {
-            list.addView(groupHeader(entry.getKey(), entry.getValue()));
+            boolean collapsed = collapsedGroups.contains(entry.getKey());
+            list.addView(groupHeader(entry.getKey(), entry.getValue(), collapsed));
+            renderedGroups++;
+            if (collapsed) {
+                continue;
+            }
             int groupShown = 0;
             for (CodexSession session : entry.getValue()) {
                 View card = card(session);
@@ -296,7 +339,7 @@ public class MainActivity extends Activity {
             }
         }
 
-        if (shown == 0) {
+        if (shown == 0 && renderedGroups == 0) {
             list.addView(emptyState());
         }
     }
@@ -317,7 +360,7 @@ public class MainActivity extends Activity {
         return groups;
     }
 
-    private View groupHeader(String groupName, List<CodexSession> grouped) {
+    private View groupHeader(String groupName, List<CodexSession> grouped, boolean collapsed) {
         int active = 0;
         int blockedCount = 0;
         for (CodexSession session : grouped) {
@@ -334,10 +377,13 @@ public class MainActivity extends Activity {
         header.setPadding(dp(12), dp(8), dp(12), dp(8));
         header.setBackground(roundRect(Color.rgb(18, 29, 23), dp(18), Color.rgb(48, 66, 54)));
 
-        TextView title = text(groupName, 15, textPrimary, Typeface.BOLD);
+        TextView title = text((collapsed ? "+ " : "- ") + groupName, 15, textPrimary, Typeface.BOLD);
         header.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         String countText = String.format(Locale.US, "%d sessions", grouped.size());
+        if (collapsed) {
+            countText += " / hidden";
+        }
         if (blockedCount > 0) {
             countText += String.format(Locale.US, " / %d blocked", blockedCount);
         } else if (active > 0) {
@@ -351,6 +397,14 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT);
         params.setMargins(0, dp(10), 0, dp(8));
         header.setLayoutParams(params);
+        header.setOnClickListener(v -> {
+            if (collapsedGroups.contains(groupName)) {
+                collapsedGroups.remove(groupName);
+            } else {
+                collapsedGroups.add(groupName);
+            }
+            renderSessions();
+        });
         return header;
     }
 
@@ -721,11 +775,16 @@ public class MainActivity extends Activity {
     }
 
     private void showSessionDetail(CodexSession session) {
+        if (detailDialogShowing || session.id.equals(loadingDetailSessionId)) {
+            return;
+        }
+        loadingDetailSessionId = session.id;
         fetchSessionDetail(session, true);
     }
 
     private void fetchSessionDetail(CodexSession session, boolean showDialog) {
         if (apiBaseUrl.isEmpty()) {
+            loadingDetailSessionId = "";
             showLocalSessionDetail(session);
             return;
         }
@@ -735,6 +794,7 @@ public class MainActivity extends Activity {
                 JSONObject root = new JSONObject(httpGet(apiBaseUrl + "/sessions/" + pathSegment(session.id)));
                 CodexSession detailed = parseSingleSession(root.getJSONObject("session"));
                 new Handler(Looper.getMainLooper()).post(() -> {
+                    loadingDetailSessionId = "";
                     replaceSession(detailed);
                     render();
                     if (showDialog) {
@@ -742,7 +802,10 @@ public class MainActivity extends Activity {
                     }
                 });
             } catch (Exception error) {
-                new Handler(Looper.getMainLooper()).post(() -> showLocalSessionDetail(session));
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    loadingDetailSessionId = "";
+                    showLocalSessionDetail(session);
+                });
             }
         }).start();
     }
@@ -775,6 +838,10 @@ public class MainActivity extends Activity {
     }
 
     private void showLocalSessionDetail(CodexSession session) {
+        if (detailDialogShowing) {
+            return;
+        }
+        detailDialogShowing = true;
         ScrollView scroll = new ScrollView(this);
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
@@ -810,15 +877,21 @@ public class MainActivity extends Activity {
             }
         }
 
-        new AlertDialog.Builder(this)
+        AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle(session.name)
                 .setView(scroll)
                 .setNegativeButton("Close", null)
-                .setPositiveButton("Prompt", (dialog, which) -> showPromptDialog(session))
-                .show();
+                .setPositiveButton("Prompt", (ignoredDialog, which) -> showPromptDialog(session))
+                .create();
+        dialog.setOnDismissListener(d -> detailDialogShowing = false);
+        dialog.show();
     }
 
     private void showPromptDialog(CodexSession session) {
+        if (promptDialogShowing) {
+            return;
+        }
+        promptDialogShowing = true;
         LinearLayout form = new LinearLayout(this);
         form.setOrientation(LinearLayout.VERTICAL);
         form.setPadding(dp(4), dp(10), dp(4), 0);
@@ -847,6 +920,7 @@ public class MainActivity extends Activity {
             queuePrompt(session, text);
             dialog.dismiss();
         }));
+        dialog.setOnDismissListener(d -> promptDialogShowing = false);
         dialog.show();
     }
 
@@ -1214,7 +1288,11 @@ public class MainActivity extends Activity {
         action.setGravity(Gravity.CENTER);
         action.setPadding(dp(8), dp(9), dp(8), dp(9));
         action.setBackground(roundRect(Color.rgb(18, 28, 22), dp(14), Color.rgb(48, 66, 54)));
-        action.setOnClickListener(v -> onClick.run());
+        action.setOnClickListener(v -> {
+            v.setEnabled(false);
+            v.postDelayed(() -> v.setEnabled(true), 900);
+            onClick.run();
+        });
         return action;
     }
 
