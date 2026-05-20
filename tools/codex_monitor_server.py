@@ -246,7 +246,7 @@ def approval_pending(messages):
     return any(marker in recent for marker in approval_markers) and not any(marker in recent for marker in resolution_markers)
 
 
-def session_from_file(file: Path, include_messages=True, workspaces=None, threads=None):
+def session_from_file(file: Path, include_messages=True, workspaces=None, threads=None, queue_counts=None):
     stat = file.stat()
     updated = datetime.fromtimestamp(stat.st_mtime)
     meta = read_first_meta(file)
@@ -284,6 +284,7 @@ def session_from_file(file: Path, include_messages=True, workspaces=None, thread
         'daemonWorkspace': daemon_workspace,
         'daemonConnected': bool(daemon_workspace and daemon_workspace.get('connected')),
         'daemonThread': daemon_thread,
+        'queuedPromptCount': int((queue_counts or {}).get(str(session_id), 0)),
     }
 
 
@@ -297,7 +298,11 @@ def session_files(codex_home: Path):
 def codex_sessions(codex_home: Path, limit: int):
     workspaces = workspace_map_from_daemon()
     threads = thread_map_from_daemon(workspaces)
-    return [session_from_file(path, workspaces=workspaces, threads=threads) for path in session_files(codex_home)[:limit]]
+    queue_counts = queued_prompt_counts(codex_home)
+    return [
+        session_from_file(path, workspaces=workspaces, threads=threads, queue_counts=queue_counts)
+        for path in session_files(codex_home)[:limit]
+    ]
 
 
 def find_session_file(codex_home: Path, session_id: str):
@@ -366,10 +371,70 @@ def write_prompt_queue(codex_home: Path, items):
                 handle.write(json.dumps(item, ensure_ascii=False) + '\n')
 
 
+def queued_prompt_counts(codex_home: Path):
+    counts = {}
+    for item in read_prompt_queue(codex_home):
+        if item.get('status') != 'queued':
+            continue
+        session_id = str(item.get('sessionId') or '').strip()
+        if session_id:
+            counts[session_id] = counts.get(session_id, 0) + 1
+    return counts
+
+
+def prompt_queue_summary(codex_home: Path, recent_limit=5):
+    items = read_prompt_queue(codex_home)
+    queued = [item for item in items if item.get('status') == 'queued']
+    sent = [item for item in items if item.get('status') == 'sent']
+    invalid = [item for item in items if item.get('status') == 'invalid']
+    last_error = ''
+    last_request = None
+
+    for item in reversed(items):
+        if last_request is None and item.get('status') != 'invalid':
+            last_request = {
+                'sessionId': item.get('sessionId') or '',
+                'name': item.get('sessionName') or item.get('name') or '',
+                'status': item.get('status') or '',
+                'timestamp': item.get('timestamp') or '',
+                'lastAttemptAt': item.get('lastAttemptAt') or '',
+            }
+        daemon = item.get('daemon') if isinstance(item, dict) else None
+        if isinstance(daemon, dict) and daemon.get('error') and not last_error:
+            last_error = str(daemon.get('error'))
+        if last_request and last_error:
+            break
+
+    recent = []
+    for item in reversed(items[-recent_limit:]):
+        if not isinstance(item, dict):
+            continue
+        daemon = item.get('daemon') if isinstance(item.get('daemon'), dict) else {}
+        recent.append({
+            'sessionId': item.get('sessionId') or '',
+            'name': item.get('sessionName') or item.get('name') or '',
+            'status': item.get('status') or '',
+            'timestamp': item.get('timestamp') or '',
+            'lastAttemptAt': item.get('lastAttemptAt') or '',
+            'daemonError': daemon.get('error') or daemon.get('reason') or '',
+        })
+
+    return {
+        'total': len(items),
+        'queued': len(queued),
+        'sent': len(sent),
+        'invalid': len(invalid),
+        'bySession': queued_prompt_counts(codex_home),
+        'lastError': trim(last_error, 200),
+        'lastRequest': last_request,
+        'recent': recent,
+    }
+
+
 def drain_prompt_queue(codex_home: Path, limit=10):
     items = read_prompt_queue(codex_home)
     if not items:
-        return {'attempted': 0, 'sent': 0, 'remaining': 0}
+        return {'attempted': 0, 'sent': 0, 'remaining': 0, 'summary': prompt_queue_summary(codex_home)}
 
     attempted = 0
     sent = 0
@@ -401,7 +466,7 @@ def drain_prompt_queue(codex_home: Path, limit=10):
 
     write_prompt_queue(codex_home, items)
     remaining = sum(1 for item in items if item.get('status') == 'queued')
-    return {'attempted': attempted, 'sent': sent, 'remaining': remaining}
+    return {'attempted': attempted, 'sent': sent, 'remaining': remaining, 'summary': prompt_queue_summary(codex_home)}
 
 
 def daemon_execution_disabled():
@@ -493,6 +558,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/daemon':
             self.write_json(200, {'daemon': daemon_status()})
             return
+        if path == '/queue':
+            self.write_json(200, {'queue': prompt_queue_summary(self.codex_home)})
+            return
         if path == '/sessions':
             self.write_json(200, {'sessions': codex_sessions(self.codex_home, self.limit)})
             return
@@ -502,7 +570,8 @@ class Handler(BaseHTTPRequestHandler):
             if not file:
                 self.write_json(404, {'error': 'session not found'})
                 return
-            self.write_json(200, {'session': session_from_file(file, workspaces=workspace_map_from_daemon())})
+            queue_counts = queued_prompt_counts(self.codex_home)
+            self.write_json(200, {'session': session_from_file(file, workspaces=workspace_map_from_daemon(), queue_counts=queue_counts)})
             return
         self.write_json(404, {'error': 'not found'})
 
@@ -516,6 +585,11 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(body)
         except Exception:
             self.write_json(400, {'error': 'invalid json'})
+            return
+
+        if path == '/queue/drain':
+            result = drain_prompt_queue(self.codex_home)
+            self.write_json(200, {'ok': True, 'queue': result})
             return
 
         if path == '/sessions':
@@ -584,6 +658,8 @@ class Handler(BaseHTTPRequestHandler):
         item = queue_prompt(self.codex_home, {
             'sessionId': session_id,
             'sessionFile': str(file),
+            'sessionName': str(payload.get('name') or '').strip(),
+            'detail': str(payload.get('detail') or '').strip(),
             'prompt': prompt,
             'source': 'android',
             'daemon': daemon_result,

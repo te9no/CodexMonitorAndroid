@@ -141,6 +141,7 @@ class BridgeApp:
         self.stopping = False
         self.status_refresh_running = False
         self.queue_drain_running = False
+        self.queue_status_refresh_running = False
 
         self.root = Tk()
         self.root.title('Codex Monitor Bridge')
@@ -149,6 +150,7 @@ class BridgeApp:
 
         self.listener_status = StringVar(value='Stopped')
         self.daemon_status = StringVar(value='Checking...')
+        self.queue_status = StringVar(value='Checking...')
         self.server_url = StringVar(value=self.android_url())
         self.token_path = StringVar(value=str(self.config_dir / BRIDGE_TOKEN_FILE))
         self.daemon_token_path = StringVar(value=str(self.config_dir / DAEMON_TOKEN_FILE))
@@ -158,6 +160,7 @@ class BridgeApp:
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
         self.root.after(150, self.start_server)
         self.root.after(500, self.refresh_daemon_status)
+        self.root.after(900, self.refresh_queue_status)
         self.root.after(3000, self.drain_prompt_queue)
 
     def android_url(self) -> str:
@@ -177,6 +180,7 @@ class BridgeApp:
         self.add_value_row(status_frame, 'Listener', self.listener_status)
         self.add_value_row(status_frame, 'Android Server URL', self.server_url)
         self.add_value_row(status_frame, 'Daemon', self.daemon_status)
+        self.add_value_row(status_frame, 'Prompt queue', self.queue_status)
 
         button_row = ttk.Frame(root)
         button_row.pack(fill=X, pady=(10, 14))
@@ -186,6 +190,7 @@ class BridgeApp:
         self.stop_button.pack(side=LEFT, padx=(8, 0))
         ttk.Button(button_row, text='Copy URL', command=self.copy_url).pack(side=LEFT, padx=(8, 0))
         ttk.Button(button_row, text='Open Android URL', command=lambda: webbrowser.open(self.server_url.get())).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(button_row, text='Retry queue now', command=self.drain_prompt_queue).pack(side=LEFT, padx=(8, 0))
         ttk.Button(button_row, text='Refresh daemon', command=self.refresh_daemon_status).pack(side=RIGHT)
 
         settings = ttk.LabelFrame(root, text='Tokens', padding=12)
@@ -309,6 +314,34 @@ class BridgeApp:
             self.log(f'Daemon error: {status.get("error", "unknown")}')
         self.root.after(10000, self.refresh_daemon_status)
 
+    def refresh_queue_status(self) -> None:
+        if self.queue_status_refresh_running:
+            return
+        self.queue_status_refresh_running = True
+
+        def worker() -> None:
+            self.configure_server_module()
+            summary = codex_monitor_server.prompt_queue_summary(codex_monitor_server.Handler.codex_home)
+            self.root.after(0, lambda: self.apply_queue_summary(summary, True))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_queue_summary(self, summary: dict, schedule_refresh: bool = False) -> None:
+        if schedule_refresh:
+            self.queue_status_refresh_running = False
+        queued = int(summary.get('queued') or 0)
+        sent = int(summary.get('sent') or 0)
+        invalid = int(summary.get('invalid') or 0)
+        last_error = str(summary.get('lastError') or '').strip()
+        status = f'Queued {queued}, sent {sent}'
+        if invalid:
+            status += f', invalid {invalid}'
+        if last_error:
+            status += f' - last error: {last_error[:90]}'
+        self.queue_status.set(status)
+        if schedule_refresh:
+            self.root.after(10000, self.refresh_queue_status)
+
     def drain_prompt_queue(self) -> None:
         if self.queue_drain_running:
             return
@@ -326,6 +359,9 @@ class BridgeApp:
         attempted = int(result.get('attempted') or 0)
         sent = int(result.get('sent') or 0)
         remaining = int(result.get('remaining') or 0)
+        summary = result.get('summary')
+        if isinstance(summary, dict):
+            self.apply_queue_summary(summary)
         if sent:
             self.log(f'Prompt queue: sent {sent}, remaining {remaining}.')
         elif attempted:

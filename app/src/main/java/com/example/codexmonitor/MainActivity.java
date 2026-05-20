@@ -442,6 +442,13 @@ public class MainActivity extends Activity {
             titleBlock.addView(daemon);
         }
 
+        if (session.queuedPromptCount > 0) {
+            TextView queued = text(session.queuedPromptCount + " queued prompt" + (session.queuedPromptCount == 1 ? "" : "s"), 12,
+                    blocked, Typeface.BOLD);
+            queued.setPadding(0, dp(4), 0, 0);
+            titleBlock.addView(queued);
+        }
+
         top.addView(titleBlock, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         TextView status = pill(session.status, statusColor(session.status), false);
@@ -571,6 +578,7 @@ public class MainActivity extends Activity {
                         new ArrayList<>(),
                         "Manual",
                         "",
+                        0,
                         false,
                         false));
             } else {
@@ -690,6 +698,7 @@ public class MainActivity extends Activity {
                     parseMessages(item.optJSONArray("messages")),
                     sessionGroup(item),
                     item.optString("cwd", ""),
+                    item.optInt("queuedPromptCount", 0),
                     item.has("daemonConnected"),
                     item.optBoolean("daemonConnected", false)));
         }
@@ -821,6 +830,7 @@ public class MainActivity extends Activity {
                 parseMessages(item.optJSONArray("messages")),
                 sessionGroup(item),
                 item.optString("cwd", ""),
+                item.optInt("queuedPromptCount", 0),
                 item.has("daemonConnected"),
                 item.optBoolean("daemonConnected", false));
     }
@@ -856,6 +866,9 @@ public class MainActivity extends Activity {
         }
         if (session.daemonKnown) {
             metaText += "\nDaemon " + (session.daemonConnected ? "connected" : "not connected");
+        }
+        if (session.queuedPromptCount > 0) {
+            metaText += "\nQueued prompts " + session.queuedPromptCount;
         }
         TextView meta = text(metaText, 14, Color.rgb(77, 88, 78), Typeface.BOLD);
         body.addView(meta);
@@ -934,16 +947,48 @@ public class MainActivity extends Activity {
                 JSONObject response = postPromptWithFallback(session, prompt);
                 boolean sent = response.optBoolean("sent", false);
                 boolean queued = response.optBoolean("queued", false);
-                String message = sent
-                        ? "Prompt sent via daemon"
-                        : queued ? "Prompt queued on PC" : "Prompt accepted by PC bridge";
-                new Handler(Looper.getMainLooper()).post(() ->
-                        Toast.makeText(this, message, Toast.LENGTH_SHORT).show());
+                String title = sent ? "Prompt sent" : queued ? "Prompt queued" : "Prompt accepted";
+                String message = promptResultMessage(response);
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    if (queued) {
+                        session.queuedPromptCount += 1;
+                        render();
+                        saveSessions();
+                    }
+                    new AlertDialog.Builder(this)
+                            .setTitle(title)
+                            .setMessage(message)
+                            .setPositiveButton("OK", null)
+                            .show();
+                    fetchRemoteSessions(false);
+                });
             } catch (Exception error) {
                 new Handler(Looper.getMainLooper()).post(() ->
                         Toast.makeText(this, "Prompt failed: " + error.getMessage(), Toast.LENGTH_LONG).show());
             }
         }).start();
+    }
+
+    private String promptResultMessage(JSONObject response) {
+        boolean sent = response.optBoolean("sent", false);
+        boolean queued = response.optBoolean("queued", false);
+        if (sent) {
+            return "The prompt was delivered to the connected Codex daemon.";
+        }
+        if (!queued) {
+            return "The PC bridge accepted the request.";
+        }
+
+        JSONObject item = response.optJSONObject("item");
+        JSONObject daemon = item == null ? response.optJSONObject("daemon") : item.optJSONObject("daemon");
+        String reason = "";
+        if (daemon != null) {
+            reason = daemon.optString("error", daemon.optString("reason", ""));
+        }
+        if (reason.isEmpty()) {
+            reason = "The PC bridge will retry when the daemon session is available.";
+        }
+        return "The prompt is stored on the PC bridge queue.\n\nReason: " + reason;
     }
 
     private JSONObject postPromptWithFallback(CodexSession session, String prompt) throws Exception {
@@ -1144,6 +1189,7 @@ public class MainActivity extends Activity {
                         parseMessages(item.optJSONArray("messages")),
                         item.optString("groupName", item.optString("name", "Ungrouped")),
                         item.optString("cwd", ""),
+                        item.optInt("queuedPromptCount", 0),
                         item.has("daemonConnected"),
                         item.optBoolean("daemonConnected", false)));
             }
@@ -1165,6 +1211,7 @@ public class MainActivity extends Activity {
                 item.put("approvalPending", session.approvalPending);
                 item.put("groupName", session.groupName);
                 item.put("cwd", session.cwd);
+                item.put("queuedPromptCount", session.queuedPromptCount);
                 item.put("daemonConnected", session.daemonConnected);
                 JSONArray messages = new JSONArray();
                 for (CodexMessage message : session.messages) {
@@ -1197,6 +1244,7 @@ public class MainActivity extends Activity {
                 new ArrayList<>(),
                 "Examples",
                 "",
+                0,
                 false,
                 false));
         sessions.add(new CodexSession(
@@ -1209,6 +1257,7 @@ public class MainActivity extends Activity {
                 new ArrayList<>(),
                 "Examples",
                 "",
+                0,
                 false,
                 false));
         sessions.add(new CodexSession(
@@ -1221,6 +1270,7 @@ public class MainActivity extends Activity {
                 new ArrayList<>(),
                 "Examples",
                 "",
+                0,
                 false,
                 false));
         saveSessions();
@@ -1399,10 +1449,11 @@ public class MainActivity extends Activity {
         List<CodexMessage> messages;
         String groupName;
         String cwd;
+        int queuedPromptCount;
         boolean daemonKnown;
         boolean daemonConnected;
 
-        CodexSession(String id, String name, String detail, String status, String updatedAt, boolean approvalPending, List<CodexMessage> messages, String groupName, String cwd, boolean daemonKnown, boolean daemonConnected) {
+        CodexSession(String id, String name, String detail, String status, String updatedAt, boolean approvalPending, List<CodexMessage> messages, String groupName, String cwd, int queuedPromptCount, boolean daemonKnown, boolean daemonConnected) {
             this.id = id;
             this.name = name;
             this.detail = detail;
@@ -1412,6 +1463,7 @@ public class MainActivity extends Activity {
             this.messages = messages;
             this.groupName = groupName == null || groupName.isEmpty() ? "Ungrouped" : groupName;
             this.cwd = cwd == null ? "" : cwd;
+            this.queuedPromptCount = Math.max(0, queuedPromptCount);
             this.daemonKnown = daemonKnown;
             this.daemonConnected = daemonConnected;
         }
